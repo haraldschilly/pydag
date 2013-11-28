@@ -3,6 +3,7 @@
 from __future__ import division
 import re
 import os
+from collections import OrderedDict, defaultdict
 import numpy as np
 import numpy.distutils.__config__
 import theano as th
@@ -23,6 +24,17 @@ class Node(object):
     def add_child(self, node, factor=1):
         self.children.append((factor, node))
 
+    def get_input(self, i):
+        f, v = self.children[i]
+        return f * v.value() if f != 1 else v.value()
+
+    def update(self, **attrs):
+        self.__dict__.update(attrs)
+
+    def get_all_input(self):
+        p = lambda (f, v): f * v.value() if f != 1 else v.value()
+        return map(p, self.children)
+
     def value(self):
         raise Exception("child node has to implement suitable val(...) method")
 
@@ -36,30 +48,29 @@ class Operator(Node):
     def value(self):
         op = self.op
         if op == '+':
-            return sum(f * n.value() for f, n in self.children)
+            return sum(self.get_all_input())
         elif op == '*':
             from operator import mul
-            return reduce(mul, (f * n.value() for f, n in self.children))
+            return reduce(mul, self.get_all_input())
         elif op == 'square':
             assert len(self.children) == 1
-            f, n = self.children[0]
-            return (f * n.value()) ** 2.
+            return self.get_input(0) ** 2.
         elif op == '^':
             assert len(self.children) == 2
-            (fl, l), (fr, r) = self.children
-            return (fl * l.value()) ** (fr * r.value())
+            b = self.get_input(0)
+            e = self.get_input(1)
+            return b ** e
         elif op == '/':
             assert len(self.children) == 2
-            (fl, l), (fr, r) = self.children
-            return (fl * l.value()) / (fr * r.value())
+            n = self.get_input(0)
+            d = self.get_input(0)
+            return n / d
         elif op == 'sin':
             assert len(self.children) == 1
-            f, n = self.children[0]
-            return f * T.sin(n.value())
+            return T.sin(self.get_input(0))
         elif op == 'exp':
             assert len(self.children) == 1
-            f, n = self.children[0]
-            return f * T.exp(n.value())
+            return T.exp(self.get_input(0))
         else:
             raise Exception("Unkonwn Op: '%s'" % op)
 
@@ -73,9 +84,6 @@ class Variable(Node):
         super(Variable, self).__init__()
         self.var = T.scalar()
         self.bound = [-np.Inf, np.Inf]  # default
-
-    def update(self, **attrs):
-        self.__dict__.update(attrs)
 
     def set_name(self, name):
         self.var.name = name
@@ -99,6 +107,50 @@ class Constant(Node):
     def __str__(self):
         return "Constant[%s]" % self.v
 
+# END Classes in a Node
+
+# START DAG specific classes
+
+
+class Objective(object):
+
+    def __init__(self, name=None):
+        self.minimize = True
+        self.name = name
+        self.expression = None
+        self.add = None
+        self.mult = None
+        self.node = None
+
+    def set_node(self, node):
+        """
+        the node in the dag
+        """
+        self.node = node
+
+    def value(self):
+        # obj = (mult * f(x)) + add
+        v = self.node.value()
+        if self.mult is not None:
+            v *= self.mult
+        if self.add is not None:
+            v += self.add
+        return v
+
+    def __str__(self):
+        return "Objective{%s, add=%s, mult=%s, node=%s}" \
+            % ("min" if self.minimize else "max", self.add, self.mult, self.node)
+
+
+class Constraint(object):
+
+    def __init__(self, expression, name=None):
+        self.expression = expression
+        self.name = name
+        self.bound = [-np.Inf, np.Inf]  # default
+
+# END DAG specific classes
+
 
 def parse_bound(b):
     """
@@ -112,13 +164,17 @@ def parse_bound(b):
         else:
             return float(n)
     return map(parse_number, parse_bound.bnd.match(b).groups())
+
 parse_bound.bnd = re.compile(r"\[([^,]+),([^\]]+)\]")
 
 
 def parse_attributes(tokens):
     """
+    helper function
     each node has a list of possible attributes.
     they are like [ "b [1,1]", "d 0.5", ...]
+     - b: bounds and they are parsed
+     - d: data and a list of parsed floats
     """
     attrs = {}
     for token in tokens:
@@ -141,25 +197,13 @@ def parse_attributes(tokens):
 class DAG(object):
 
     """
-    Python representation of a COCONUT Dag.
+    A Python representation of a (simplified) COCONUT Dag based on "theano".
     """
-    class Objective(object):
-
-        def __init__(self, expression, name=None):
-            self.minimize = True
-            self.expression = expression
-            self.name = name
-
-    class Constraint(object):
-
-        def __init__(self, expression, bounds=None, name=None):
-            self.expression = expression
-            self.name = name
-            self.bounds = bounds if bounds is not None else (-np.inf, np.inf)
 
     def __init__(self):
-        self.variables = []
-        self.objective = None  # TODO or several ones?
+
+        self.variables = defaultdict(Variable)
+        self.objective = Objective()
         self.constraints = []
 
     def __str__(self):
@@ -167,43 +211,52 @@ class DAG(object):
 
     @staticmethod
     def parse(fn, dag_ser):
-        from collections import OrderedDict, defaultdict
         #cls = re.compile(r"^<([^>]+)>")
         nodes = {}
         edges = OrderedDict()  # edgeN : operator | constant
-        globs = []  # instructions: V 2, M 0 min, c 0 9, ... ?
-        variables = defaultdict(Variable)
-        objective = None
+
+        # instructions in "N" nodes: V 2, M 0 min, c 0 9, ... ?
+        globs = []  # just for debugging
+
+        dag = DAG()
+        variables =
+        objective = dag.objective
         constr_nodes = []
 
         for line in dag_ser.splitlines():
             i = line.find("> ")  # first split at the end of the node id
             token0 = line[1:i]
             tokens = line[i + 2:].split(": ")
-            # print "tokens:", tokens
-            #token0 = cls.match(token0)
-            # if token0 is None or len(token0.groups()) != 1:
-            #    raise Exception("token_0: '%s' unknown" % tokens[0])
-            #token0 = token0.groups()[0]
 
             if token0 == "N":
                 globs.append(tokens[1:])
-                data = tokens[0].split(" ")
+                attrs = parse_attributes(tokens[1:])
+                print "ATTRS:", attrs
+                data = tokens[0].split()
                 t = data.pop(0)
                 if t == 'V':
                     # ignored!
                     pass
 
                 elif t == "M":
-                    objective = int(data[0]), data[1]
+                    objective.set_node(nodes[int(data[0])])
+                    assert data[1] in ["min", "max"]
+                    objective.minimize = data[1] == "min"
 
                 elif t == "N":
                     # N <number> 'name'
                     variables[int(data[0])].set_name(data[1][1:-1])
 
                 elif t == "O":
-                    # names are ignored
-                    print "ignored:", tokens
+                    # objective: O 'oname' : d obj_add [, obj_mult]
+                    # print "N objective:", tokens
+                    # print "N objective:", attrs
+                    if "data" in attrs:
+                        d = attrs["data"]
+                        if len(d) >= 1:
+                            objective.add = float(d[0])
+                        if len(d) == 2:
+                            objective.mult = float(d[1])
 
                 elif t == 'c':
                     constr_nodes.append(int(data[1]))
@@ -216,7 +269,7 @@ class DAG(object):
                     raise Exception("unknown node type '%s'" % t)
 
             elif token0 == "E":
-                src, targ, val = tokens.pop().split(" ")
+                src, targ, val = tokens.pop().split()
                 k = int(src), int(targ)
                 edges[k] = float(val)
 
@@ -237,7 +290,7 @@ class DAG(object):
                 elif op[0] == 'C':
                     nodes[n] = Constant(float(op[2:]))
 
-                elif op in ['+', '*', '^', '^I', '/', 'sin', 'cos', 'exp', 'sinh', 'cosh', 'log', 'gauss', 'poly']:
+                elif op in ['+', '*', '^', '^I', '/', 'sin', 'cos', 'exp']:
                     nodes[n] = Operator(op)
 
                 elif op == '2':
@@ -268,14 +321,14 @@ class DAG(object):
             # print src, targ, val
             nodes[src].add_child(nodes[targ], val)
 
-        obj = nodes[objective[0]].value()
+        obj = objective.value()
         constr = [nodes[idx].value() for idx in constr_nodes]
         exprs = [obj] + constr
-        f = th.function(inputs=[_.var for _ in x],
-                        outputs=exprs)
+        print exprs
+        f = th.function(inputs=[_.var for _ in x],  outputs=exprs)
         print "Objective:\n", th.printing.pp(obj)
         for i, c in enumerate(constr):
-            print "Constraint %d:\n", th.printing.pp(c)
+            print "Constraint %d:\n" % i, th.printing.pp(c)
         #args = 2. * np.random.rand(len(variables), 1000) - 1.
         # print np.apply_along_axis(lambda x : f(*x), 0, args)
 
