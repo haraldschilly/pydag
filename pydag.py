@@ -21,19 +21,19 @@ class Node(object):
     def __init__(self):
         self.children = []
 
-    def add_child(self, node, factor=1):
+    def add_child(self, node, factor=1.):
         self.children.append((factor, node))
 
     def get_input(self, i):
         f, v = self.children[i]
-        return f * v.value() if f != 1 else v.value()
+        return f * v.value() if f != 1. else v.value()
+
+    def get_all_input(self):
+        p = lambda (f, v): f * v.value() if f != 1. else v.value()
+        return map(p, self.children)
 
     def update(self, **attrs):
         self.__dict__.update(attrs)
-
-    def get_all_input(self):
-        p = lambda (f, v): f * v.value() if f != 1 else v.value()
-        return map(p, self.children)
 
     def value(self):
         raise Exception("child node has to implement suitable val(...) method")
@@ -44,33 +44,65 @@ class Operator(Node):
     def __init__(self, op):
         super(Operator, self).__init__()
         self.op = op
+        # maybe updated via an attribute with a float-array
+        self.data = None
 
     def value(self):
         op = self.op
         if op == '+':
-            return sum(self.get_all_input())
+            s = T.stack(*self.get_all_input()).sum()
+            #s = sum(self.get_all_input()) # that's probably worse
+            #print "DEBUG S"
+            #print th.printing.debugprint(s)
+            if self.data is not None:
+                s += self.data[0]
+            return s
+
         elif op == '*':
-            from operator import mul
-            return reduce(mul, self.get_all_input())
+            m = T.stack(*self.get_all_input()).prod()
+            if self.data is not None:
+                m *= self.data[0]
+            return m
+
         elif op == 'square':
             assert len(self.children) == 1
-            return self.get_input(0) ** 2.
+            v = self.get_input(0)
+            if self.data is not None:
+                v += self.data[0]
+            return v ** 2.
+
         elif op == '^':
             assert len(self.children) == 2
             b = self.get_input(0)
             e = self.get_input(1)
             return b ** e
+
         elif op == '/':
             assert len(self.children) == 2
             n = self.get_input(0)
             d = self.get_input(0)
             return n / d
+
+        elif op == 'min': # not tested
+            vals = self.get_all_input()
+            if self.data is not None:
+                vals.append(self.data[0])
+            return vals.min()
+
+        elif op == 'max': # not tested
+            vals = self.get_all_input()
+            if self.data is not None:
+                vals.append(self.data[0])
+            return vals.max()
+
         elif op == 'sin':
             assert len(self.children) == 1
             return T.sin(self.get_input(0))
+
         elif op == 'exp':
             assert len(self.children) == 1
             return T.exp(self.get_input(0))
+
         else:
             raise Exception("Unkonwn Op: '%s'" % op)
 
@@ -144,10 +176,18 @@ class Objective(object):
 
 class Constraint(object):
 
-    def __init__(self, expression, name=None):
-        self.expression = expression
+    def __init__(self, node_id):
+        self.node_id = node_id # will be replaced in set_expression later!
+
+    def set_expression(self, ex):
+        self.expression = ex
+
+    @property
+    def bound(self):
+        return self.expression.bound
+
+    def set_name(self, name):
         self.name = name
-        self.bound = [-np.Inf, np.Inf]  # default
 
 # END DAG specific classes
 
@@ -202,9 +242,9 @@ class DAG(object):
 
     def __init__(self):
 
-        self.variables = defaultdict(Variable)
         self.objective = Objective()
-        self.constraints = []
+        self.variables = defaultdict(Variable)
+        self.constraints = {}
 
     def __str__(self):
         return "DAG@%s" % id(self)
@@ -214,14 +254,12 @@ class DAG(object):
         #cls = re.compile(r"^<([^>]+)>")
         nodes = {}
         edges = OrderedDict()  # edgeN : operator | constant
+        constr_mapping = {} # [(constr_idx <-> node_id), ...]
 
         # instructions in "N" nodes: V 2, M 0 min, c 0 9, ... ?
         globs = []  # just for debugging
 
         dag = DAG()
-        variables =
-        objective = dag.objective
-        constr_nodes = []
 
         for line in dag_ser.splitlines():
             i = line.find("> ")  # first split at the end of the node id
@@ -239,13 +277,13 @@ class DAG(object):
                     pass
 
                 elif t == "M":
-                    objective.set_node(nodes[int(data[0])])
+                    dag.objective.set_node(nodes[int(data[0])])
                     assert data[1] in ["min", "max"]
-                    objective.minimize = data[1] == "min"
+                    dag.objective.minimize = data[1] == "min"
 
                 elif t == "N":
                     # N <number> 'name'
-                    variables[int(data[0])].set_name(data[1][1:-1])
+                    dag.variables[int(data[0])].set_name(data[1][1:-1])
 
                 elif t == "O":
                     # objective: O 'oname' : d obj_add [, obj_mult]
@@ -254,12 +292,15 @@ class DAG(object):
                     if "data" in attrs:
                         d = attrs["data"]
                         if len(d) >= 1:
-                            objective.add = float(d[0])
+                            dag.objective.add = float(d[0])
                         if len(d) == 2:
-                            objective.mult = float(d[1])
+                            dag.objective.mult = float(d[1])
 
                 elif t == 'c':
-                    constr_nodes.append(int(data[1]))
+                    idx, node_id = map(int, data)
+                    assert idx not in constr_mapping
+                    # problem: node is not defined so far!
+                    dag.constraints[idx] = Constraint(node_id)
 
                 elif t == 'C':
                     # constraint name, ignored
@@ -277,42 +318,39 @@ class DAG(object):
                 n = int(token0)
                 assert n not in nodes
 
-                op = tokens.pop()
-                attrs = parse_attributes(tokens)
+                ops = tokens.pop().split()
                 # print "op:    ", op
                 # print "tokens:", tokens
-                if op[0] == 'V':
-                    idx = int(op[2:])  # index in "V <idx>"
-                    var = variables[idx]
-                    var.update(**attrs)
-                    nodes[n] = var
+                if ops[0] == 'V':
+                    idx = int(ops[1])  # index in "V <idx>"
+                    nodes[n] = dag.variables[idx]
 
-                elif op[0] == 'C':
-                    nodes[n] = Constant(float(op[2:]))
+                elif ops[0] == 'C':
+                    nodes[n] = Constant(float(ops[1]))
 
-                elif op in ['+', '*', '^', '^I', '/', 'sin', 'cos', 'exp']:
-                    nodes[n] = Operator(op)
+                elif ops[0] in ['+', '*', '^', '^I', '/', 'sin', 'cos', 'exp', 'min', 'max']:
+                    nodes[n] = Operator(ops[0])
 
-                elif op == '2':
+                elif ops[0] == '2':
                     nodes[n] = Operator("square")
 
                 else:
                     raise Exception("Unknown operator '%s'" % op)
 
+                # finally, update attributes like "data" in the node
+                attrs = parse_attributes(tokens)
+                nodes[n].update(**attrs)
+
         print "globs:"
         print globs
-        print "objective:", objective
-        # print var_nodes
-
-        # for k, v in edges.iteritems():
-        #    print k, v
 
         # start processing
         # x is the vector of variables, ordering is important!
-        x = [variables[i] for i in range(len(variables))]
+        # the following translates the dictionary into an ordered vector.
+        dag.variables = [ dag.variables[i] for i in range(len(dag.variables)) ]
 
-        bounds = [None] * len(variables)
-        for idx, var in variables.iteritems():
+        bounds = [None] * len(dag.variables)
+        for idx, var in enumerate(dag.variables):
             bounds[idx] = var.bound
         bounds = np.array(bounds)
         print "bounds:\n", bounds
@@ -321,26 +359,52 @@ class DAG(object):
             # print src, targ, val
             nodes[src].add_child(nodes[targ], val)
 
-        obj = objective.value()
-        constr = [nodes[idx].value() for idx in constr_nodes]
-        exprs = [obj] + constr
-        print exprs
-        f = th.function(inputs=[_.var for _ in x],  outputs=exprs)
-        print "Objective:\n", th.printing.pp(obj)
-        for i, c in enumerate(constr):
-            print "Constraint %d:\n" % i, th.printing.pp(c)
-        #args = 2. * np.random.rand(len(variables), 1000) - 1.
-        # print np.apply_along_axis(lambda x : f(*x), 0, args)
+        obj = dag.objective.value()
 
+        #print "DEBUG Constraints"
+        #for idx in constr_nodes:
+        #    print nodes[idx]
+        #    print [ n.children for (f, n) in nodes[idx].children]
+
+        # that should be true, right?
+        assert sorted(dag.constraints.keys()) == range(len(dag.constraints))
+
+        # set the constraints of the dag
+        for c in dag.constraints.values():
+            c.set_expression(nodes[c.node_id])
+
+        dag.constraints = [ dag.constraints[i] for i in range(len(dag.constraints))]
+        exprs = [obj] + [ c.expression.value() for c in dag.constraints ]
+        print exprs
+        f = th.function(inputs=[_.var for _ in dag.variables],
+                        outputs=exprs)
+
+        print
+        print "Objective:", dag.objective
+        print th.printing.pp(obj)
+        for i, c in enumerate(dag.constraints):
+            print
+            print "Constraint %d:" % i
+            print "  bound:", c.bound
+            print "   expr:", th.printing.pp(c.expression.value())
+
+        print
+        print dag.constraints
+
+        print
         print "10 random evaluations:"
         for _ in range(10):
-            arg = 2. * np.random.rand(len(variables)) - 1.
+            arg = 2. * np.random.rand(len(dag.variables)) - 1.
             print "f(%s) = %s" % (arg, f(*arg))
 
-        #outfile = os.path.expanduser("%s.png" % os.path.splitext(fn)[0])
+        #outfile = os.path.expanduser("%s.png" % os.path.splitext(os.path.basename(fn))[0])
         #th.printing.pydotprint(f, outfile=outfile)
 
-        return DAG()  # END parse()
+        print
+        print "Debug Printing of f"
+        print th.printing.debugprint(f)
+
+        return dag  # END parse()
 
 if __name__ == "__main__":
     import sys
