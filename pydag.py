@@ -4,6 +4,11 @@ from __future__ import division
 import re
 import os
 from collections import OrderedDict, defaultdict
+
+import logging
+logger = logging.getLogger("pyDAG")
+logger.addHandler(logging.StreamHandler())
+
 import numpy as np
 import numpy.distutils.__config__
 import theano as th
@@ -16,6 +21,12 @@ class Node(object):
 
     """
     superclass for all types of nodes.
+
+    the children are ordered (important for non-commutative operations)
+    and the `get_*` methods return the values of the weighted children.
+
+    the `value` method needs to be overwritten and is crucial for
+    evaluating the entire graph.
     """
 
     def __init__(self):
@@ -47,64 +58,102 @@ class Operator(Node):
         # maybe updated via an attribute with a float-array
         self.data = None
 
-    def value(self):
-        op = self.op
-        if op == '+':
-            s = T.stack(*self.get_all_input()).sum()
-            #s = sum(self.get_all_input()) # that's probably worse
-            #print "DEBUG S"
-            #print th.printing.debugprint(s)
-            if self.data is not None:
-                s += self.data[0]
-            return s
-
-        elif op == '*':
-            m = T.stack(*self.get_all_input()).prod()
-            if self.data is not None:
-                m *= self.data[0]
-            return m
-
-        elif op == 'square':
-            assert len(self.children) == 1
-            v = self.get_input(0)
-            if self.data is not None:
-                v += self.data[0]
-            return v ** 2.
-
-        elif op == '^':
-            assert len(self.children) == 2
-            b = self.get_input(0)
-            e = self.get_input(1)
-            return b ** e
-
-        elif op == '/':
-            assert len(self.children) == 2
-            n = self.get_input(0)
-            d = self.get_input(0)
-            return n / d
-
-        elif op == 'min': # not tested
-            vals = self.get_all_input()
-            if self.data is not None:
-                vals.append(self.data[0])
-            return vals.min()
-
-        elif op == 'max': # not tested
-            vals = self.get_all_input()
-            if self.data is not None:
-                vals.append(self.data[0])
-            return vals.max()
-
-        elif op == 'sin':
-            assert len(self.children) == 1
-            return T.sin(self.get_input(0))
-
-        elif op == 'exp':
-            assert len(self.children) == 1
-            return T.exp(self.get_input(0))
-
+    def add(self):
+        nbch = len(self.children)
+        assert nbch >= 1
+        if nbch == 2:
+            s = self.get_input(0) + self.get_input(1)
         else:
-            raise Exception("Unkonwn Op: '%s'" % op)
+            # s = sum(self.get_all_input()) # <- that's probably worse
+            s = T.stack(*self.get_all_input()).sum()
+        if self.data is not None:
+            s += self.data[0]
+        return s
+
+    def mult(self):
+        nbch = len(self.children)
+        assert nbch >= 1
+        if nbch == 2:
+            m = self.get_input(0) * self.get_input(1)
+        else:
+            m = T.stack(*self.get_all_input()).prod()
+        if self.data is not None:
+            m *= self.data[0]
+        return m
+
+    def square(self):
+        assert len(self.children) == 1
+        v = self.get_input(0)
+        if self.data is not None:
+            v += self.data[0]
+        return v ** 2.
+
+    def power(self):
+        assert len(self.children) == 2
+        basis = self.get_input(0)
+        exponent = self.get_input(1)
+        return T.pow(basis, exponent)
+
+    def division(self):
+        """
+        Note: This maps to the `true_div` operation.
+        """
+        assert len(self.children) == 2
+        n = self.get_input(0)
+        d = self.get_input(1)
+        return T.true_div(n, d)
+
+    def sqrt(self):
+        assert len(self.children) == 1
+        v = self.get_input(0)
+        if self.data is not None:
+            v += self.data[0]
+        return T.sqrt(v)
+
+    def min_op(self):
+        logger.warning("min op is untested")
+        vals = self.get_all_input()
+        if self.data is not None:
+            vals.append(self.data[0])
+        return vals.min()
+
+    def max_op(self):
+        logger.warning("max op is untested")
+        vals = self.get_all_input()
+        if self.data is not None:
+            vals.append(self.data[0])
+        return vals.max()
+
+    def sin(self):
+        assert len(self.children) == 1
+        return T.sin(self.get_input(0))
+
+    def cos(self):
+        assert len(self.children) == 1
+        return T.cos(self.get_input(0))
+
+    def exp(self):
+        assert len(self.children) == 1
+        return T.exp(self.get_input(0))
+
+    # this is a bit awkward, but useful in the parser function to know
+    # which operations are actually defined.
+    op_functions = {
+        '+': add,
+        '*': mult,
+        '2': square,
+        'sqrt': sqrt,
+        '^': power,
+        '/': division,
+        'min': min_op,
+        'max': max_op,
+        'sin': sin,
+        'cos': cos,
+        'exp': exp
+    }
+
+    def value(self):
+        return self.op_functions[self.op](self)
 
     def __str__(self):
         return "op[%s]" % self.op
@@ -131,7 +180,8 @@ class Constant(Node):
 
     def __init__(self, v):
         super(Constant, self).__init__()
-        self.v = v
+        # necessary, e.g., if the obj fctn is constant
+        self.v = T.as_tensor_variable(v)
 
     def value(self):
         return self.v
@@ -177,7 +227,7 @@ class Objective(object):
 class Constraint(object):
 
     def __init__(self, node_id):
-        self.node_id = node_id # will be replaced in set_expression later!
+        self.node_id = node_id  # will be replaced in set_expression later!
 
     def set_expression(self, ex):
         self.expression = ex
@@ -185,6 +235,9 @@ class Constraint(object):
     @property
     def bound(self):
         return self.expression.bound
+
+    def value(self):
+        return self.expression.value()
 
     def set_name(self, name):
         self.name = name
@@ -254,7 +307,7 @@ class DAG(object):
         #cls = re.compile(r"^<([^>]+)>")
         nodes = {}
         edges = OrderedDict()  # edgeN : operator | constant
-        constr_mapping = {} # [(constr_idx <-> node_id), ...]
+        constr_mapping = {}  # [(constr_idx <-> node_id), ...]
 
         # instructions in "N" nodes: V 2, M 0 min, c 0 9, ... ?
         globs = []  # just for debugging
@@ -289,6 +342,7 @@ class DAG(object):
                     # objective: O 'oname' : d obj_add [, obj_mult]
                     # print "N objective:", tokens
                     # print "N objective:", attrs
+                    logger.info("O oname '%s' ignored" % data[0])
                     if "data" in attrs:
                         d = attrs["data"]
                         if len(d) >= 1:
@@ -328,14 +382,11 @@ class DAG(object):
                 elif ops[0] == 'C':
                     nodes[n] = Constant(float(ops[1]))
 
-                elif ops[0] in ['+', '*', '^', '^I', '/', 'sin', 'cos', 'exp', 'min', 'max']:
+                elif ops[0] in Operator.op_functions.keys():
                     nodes[n] = Operator(ops[0])
 
-                elif ops[0] == '2':
-                    nodes[n] = Operator("square")
-
                 else:
-                    raise Exception("Unknown operator '%s'" % op)
+                    raise Exception("Unknown operator '%s'" % ops[0])
 
                 # finally, update attributes like "data" in the node
                 attrs = parse_attributes(tokens)
@@ -347,7 +398,7 @@ class DAG(object):
         # start processing
         # x is the vector of variables, ordering is important!
         # the following translates the dictionary into an ordered vector.
-        dag.variables = [ dag.variables[i] for i in range(len(dag.variables)) ]
+        dag.variables = [dag.variables[i] for i in range(len(dag.variables))]
 
         bounds = [None] * len(dag.variables)
         for idx, var in enumerate(dag.variables):
@@ -361,8 +412,8 @@ class DAG(object):
 
         obj = dag.objective.value()
 
-        #print "DEBUG Constraints"
-        #for idx in constr_nodes:
+        # print "DEBUG Constraints"
+        # for idx in constr_nodes:
         #    print nodes[idx]
         #    print [ n.children for (f, n) in nodes[idx].children]
 
@@ -373,9 +424,12 @@ class DAG(object):
         for c in dag.constraints.values():
             c.set_expression(nodes[c.node_id])
 
-        dag.constraints = [ dag.constraints[i] for i in range(len(dag.constraints))]
-        exprs = [obj] + [ c.expression.value() for c in dag.constraints ]
-        print exprs
+        dag.constraints = [dag.constraints[i]
+                           for i in range(len(dag.constraints))]
+        exprs = [obj] + [c.value() for c in dag.constraints]
+        print
+        print "exprs = ", exprs
+
         f = th.function(inputs=[_.var for _ in dag.variables],
                         outputs=exprs)
 
@@ -386,10 +440,10 @@ class DAG(object):
             print
             print "Constraint %d:" % i
             print "  bound:", c.bound
-            print "   expr:", th.printing.pp(c.expression.value())
+            print "   expr:", th.printing.pp(c.value())
 
-        print
-        print dag.constraints
+        # print
+        # print dag.constraints
 
         print
         print "10 random evaluations:"
