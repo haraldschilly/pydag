@@ -189,7 +189,7 @@ class Constant(Node):
     def __init__(self, v):
         super(Constant, self).__init__()
         # necessary, e.g., if the obj fctn is constant
-        self.v = T.as_tensor_variable(v)
+        self.v = T.constant(v)
 
     def value(self):
         return self.v
