@@ -421,7 +421,7 @@ class DAG(object):
         print
         print "Variables:"
         for idx, var in enumerate(dag.variables):
-            print "%3d: [%s] in %s" % (idx, var.name, bounds[idx])
+            print "%3d: [%5s] in %s" % (idx, var.name, bounds[idx])
 
         for (src, targ), val in edges.iteritems():
             # print src, targ, val
