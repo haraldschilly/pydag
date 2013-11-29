@@ -173,6 +173,10 @@ class Variable(Node):
     def set_name(self, name):
         self.var.name = name
 
+    @property
+    def name(self):
+        return self.var.name
+
     def value(self):
         return self.var
 
@@ -232,8 +236,14 @@ class Constraint(object):
 
     def __init__(self, node_id):
         self.node_id = node_id  # will be replaced in set_expression later!
+        self.name = None
+
+    def set_name(self, name):
+        self.name = name
 
     def set_expression(self, ex):
+        if self.name is not None:
+            ex.name = self.name
         self.expression = ex
 
     @property
@@ -326,7 +336,7 @@ class DAG(object):
             if token0 == "N":
                 globs.append(tokens[1:])
                 attrs = parse_attributes(tokens[1:])
-                print "ATTRS:", attrs
+                #print "ATTRS:", attrs
                 data = tokens[0].split()
                 t = data.pop(0)
                 if t == 'V':
@@ -361,8 +371,7 @@ class DAG(object):
                     dag.constraints[idx] = Constraint(node_id)
 
                 elif t == 'C':
-                    # constraint name, ignored
-                    pass
+                    print dag.constraints[int(data[0])].set_name(data[1][1:-1])
 
                 else:
                     raise Exception("unknown node type '%s'" % t)
@@ -408,7 +417,11 @@ class DAG(object):
         for idx, var in enumerate(dag.variables):
             bounds[idx] = var.bound
         bounds = np.array(bounds)
-        print "bounds:\n", bounds
+
+        print
+        print "Variables:"
+        for idx, var in enumerate(dag.variables):
+            print "%3d: [%s] in %s" % (idx, var.name, bounds[idx])
 
         for (src, targ), val in edges.iteritems():
             # print src, targ, val
@@ -431,18 +444,20 @@ class DAG(object):
         dag.constraints = [dag.constraints[i]
                            for i in range(len(dag.constraints))]
         exprs = [obj] + [c.value() for c in dag.constraints]
-        print
-        print "exprs = ", exprs
+        #print
+        #print "exprs = ", exprs
 
         f = th.function(inputs=[_.var for _ in dag.variables],
-                        outputs=exprs)
+                        outputs=T.stack(*exprs))
+        # just makes one single array, index 0 is the objective
+        #f = lambda *x : np.r_[fc(*x)]
 
         print
         print "Objective:", dag.objective
         print th.printing.pp(obj)
         for i, c in enumerate(dag.constraints):
             print
-            print "Constraint %d:" % i
+            print "Constraint %d [name: %s]:" % (i, c.expression.name)
             print "  bound:", c.bound
             print "   expr:", th.printing.pp(c.value())
 
@@ -451,8 +466,13 @@ class DAG(object):
 
         print
         print "10 random evaluations:"
+        b = bounds.copy()
+        # fix +/- infinity
+        b[np.isinf(b[:,0]),0] = -1000
+        b[np.isinf(b[:,1]),1] = 1000
+        w = b[:,1] - b[:,0]
         for _ in range(10):
-            arg = 2. * np.random.rand(len(dag.variables)) - 1.
+            arg =  b[:,0] + w * np.random.rand(b.shape[0])
             print "f(%s) = %s" % (arg, f(*arg))
 
         #outfile = os.path.expanduser("%s.png" % os.path.splitext(os.path.basename(fn))[0])
