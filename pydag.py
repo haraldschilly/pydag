@@ -61,7 +61,9 @@ class Operator(Node):
     def add(self):
         nbch = len(self.children)
         assert nbch >= 1
-        if nbch == 2:
+        if nbch == 1:
+            s = self.get_input(0)
+        elif nbch == 2:
             s = self.get_input(0) + self.get_input(1)
         else:
             # s = sum(self.get_all_input()) # <- that's probably worse
@@ -73,7 +75,9 @@ class Operator(Node):
     def mult(self):
         nbch = len(self.children)
         assert nbch >= 1
-        if nbch == 2:
+        if nbch == 1:
+            s = self.get_input(0)
+        elif nbch == 2:
             m = self.get_input(0) * self.get_input(1)
         else:
             m = T.stack(*self.get_all_input()).prod()
@@ -111,14 +115,14 @@ class Operator(Node):
         return T.sqrt(v)
 
     def min_op(self):
-        logger.warning("min op is untested")
+        logger.warning("min op is not tested")
         vals = self.get_all_input()
         if self.data is not None:
             vals.append(self.data[0])
         return vals.min()
 
     def max_op(self):
-        logger.warning("max op is untested")
+        logger.warning("max op is not tested")
         vals = self.get_all_input()
         if self.data is not None:
             vals.append(self.data[0])
@@ -455,7 +459,7 @@ class DAG(object):
         #th.printing.pydotprint(f, outfile=outfile)
 
         print
-        print "Debug Printing of f"
+        print "Debug Printing of compiled f:"
         print th.printing.debugprint(f)
 
         return dag  # END parse()
