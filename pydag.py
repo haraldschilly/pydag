@@ -312,12 +312,21 @@ class DAG(object):
         self.objective = Objective()
         self.variables = defaultdict(Variable)
         self.constraints = {}
+        self.func = None # will be the theano function
+        self.bounds = None
 
     def __str__(self):
         return "DAG@%s" % id(self)
 
+    @property
+    def dimensions(self):
+        return len(self.variables)
+
+    def __call__(self, *args):
+        return self.func(*args)
+
     @staticmethod
-    def parse(fn, dag_ser):
+    def parse(fn):
         #cls = re.compile(r"^<([^>]+)>")
         nodes = {}
         edges = OrderedDict()  # edgeN : operator | constant
@@ -328,7 +337,7 @@ class DAG(object):
 
         dag = DAG()
 
-        for line in dag_ser.splitlines():
+        for line in open(fn, "r"):
             i = line.find("> ")  # first split at the end of the node id
             token0 = line[1:i]
             tokens = line[i + 2:].split(": ")
@@ -336,7 +345,6 @@ class DAG(object):
             if token0 == "N":
                 globs.append(tokens[1:])
                 attrs = parse_attributes(tokens[1:])
-                #print "ATTRS:", attrs
                 data = tokens[0].split()
                 t = data.pop(0)
                 if t == 'V':
@@ -344,18 +352,18 @@ class DAG(object):
                     pass
 
                 elif t == "M":
+                    assert data[1] in ["min", "max"]  # m00 not supported
                     dag.objective.set_node(nodes[int(data[0])])
-                    assert data[1] in ["min", "max"]
                     dag.objective.minimize = data[1] == "min"
 
-                elif t == "N":
-                    # N <number> 'name'
+                elif t == "N":  # N <number> 'variable name'
                     dag.variables[int(data[0])].set_name(data[1][1:-1])
+
+                elif t == 'C':
+                    print dag.constraints[int(data[0])].set_name(data[1][1:-1])
 
                 elif t == "O":
                     # objective: O 'oname' : d obj_add [, obj_mult]
-                    # print "N objective:", tokens
-                    # print "N objective:", attrs
                     logger.info("O oname '%s' ignored" % data[0])
                     if "data" in attrs:
                         d = attrs["data"]
@@ -367,11 +375,9 @@ class DAG(object):
                 elif t == 'c':
                     idx, node_id = map(int, data)
                     assert idx not in constr_mapping
-                    # problem: node is not defined so far!
+                    # node is not defined so far, hence just the node_id
+                    # number!
                     dag.constraints[idx] = Constraint(node_id)
-
-                elif t == 'C':
-                    print dag.constraints[int(data[0])].set_name(data[1][1:-1])
 
                 else:
                     raise Exception("unknown node type '%s'" % t)
@@ -416,7 +422,7 @@ class DAG(object):
         bounds = [None] * len(dag.variables)
         for idx, var in enumerate(dag.variables):
             bounds[idx] = var.bound
-        bounds = np.array(bounds)
+        bounds = dag.bounds = np.array(bounds)
 
         print
         print "Variables:"
@@ -443,12 +449,15 @@ class DAG(object):
 
         dag.constraints = [dag.constraints[i]
                            for i in range(len(dag.constraints))]
-        exprs = [obj] + [c.value() for c in dag.constraints]
-        #print
-        #print "exprs = ", exprs
+
+        outputs = [obj]
+        if len(dag.constraints) > 0:
+            cs = T.stack(*[c.value() for c in dag.constraints])
+            outputs.append(cs)
 
         f = th.function(inputs=[_.var for _ in dag.variables],
-                        outputs=T.stack(*exprs))
+                        outputs=outputs)
+        dag.func = f
         # just makes one single array, index 0 is the objective
         #f = lambda *x : np.r_[fc(*x)]
 
@@ -468,11 +477,11 @@ class DAG(object):
         print "10 random evaluations:"
         b = bounds.copy()
         # fix +/- infinity
-        b[np.isinf(b[:,0]),0] = -1000
-        b[np.isinf(b[:,1]),1] = 1000
-        w = b[:,1] - b[:,0]
+        b[np.isinf(b[:, 0]), 0] = -1000
+        b[np.isinf(b[:, 1]), 1] = 1000
+        w = b[:, 1] - b[:, 0]
         for _ in range(10):
-            arg =  b[:,0] + w * np.random.rand(b.shape[0])
+            arg = b[:, 0] + w * np.random.rand(b.shape[0])
             print "f(%s) = %s" % (arg, f(*arg))
 
         #outfile = os.path.expanduser("%s.png" % os.path.splitext(os.path.basename(fn))[0])
@@ -490,4 +499,4 @@ if __name__ == "__main__":
     for arg in sys.argv[1:]:
         for fn in glob(arg):
             print fn
-            print DAG.parse(fn, open(fn, "r").read())
+            print DAG.parse(fn)
